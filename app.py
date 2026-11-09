@@ -24,6 +24,35 @@ warnings.filterwarnings("ignore", module="statsmodels")                     # Ho
 st.set_page_config(page_title="Pharma Operations Intelligence", page_icon="💊", layout="wide")  # page settings
 alt.data_transformers.disable_max_rows()                                    # allow charts with many points
 BLUE, ORANGE, RED, GREY = "#1f4e79", "#f28e2b", "#c0392b", "#7f7f7f"        # chart colours
+TONES = {"blue": ("#1f4e79", "#2e86c1"), "green": ("#1e8449", "#52be80"), "orange": ("#d35400", "#f5b041"),  # card gradients
+         "red": ("#922b21", "#e74c3c"), "purple": ("#5b2c6f", "#a569bd"), "teal": ("#0e6655", "#48c9b0")}
+st.markdown("""
+<style>
+.banner {background: linear-gradient(120deg, #0b2e4f 0%, #1f4e79 55%, #2e86c1 100%); color: #fff;
+         padding: 22px 28px; border-radius: 16px; margin-bottom: 18px; box-shadow: 0 6px 18px rgba(31,78,121,.25);}
+.banner h1 {color: #fff; font-size: 1.9rem; margin: 0; padding: 0;}
+.banner p {color: #dbe9f6; margin: 6px 0 0 0; font-size: .95rem;}
+.kpi {border-radius: 16px; padding: 16px 18px 14px 18px; color: #fff; min-height: 132px; margin-bottom: 12px;
+      box-shadow: 0 6px 16px rgba(0,0,0,.14); transition: transform .15s ease, box-shadow .15s ease;}
+.kpi:hover {transform: translateY(-3px); box-shadow: 0 10px 22px rgba(0,0,0,.20);}
+.kpi .top {display: flex; justify-content: space-between; align-items: center;}
+.kpi .label {font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; opacity: .92; font-weight: 600;}
+.kpi .icon {font-size: 1.5rem; background: rgba(255,255,255,.18); border-radius: 50%; width: 42px; height: 42px;
+            display: flex; align-items: center; justify-content: center;}
+.kpi .value {font-size: clamp(1.25rem, 2vw, 1.95rem); font-weight: 800; line-height: 1.15; margin-top: 6px;}
+.kpi .sub {font-size: .8rem; opacity: .92; margin-top: 2px;}
+.kpi .bar {height: 6px; background: rgba(255,255,255,.25); border-radius: 4px; margin-top: 10px; overflow: hidden;}
+.kpi .bar > div {height: 100%; background: #fff; border-radius: 4px;}
+div[data-testid="stTabs"] button p {font-weight: 600;}
+</style>""", unsafe_allow_html=True)                                         # page styles: banner and KPI cards
+
+
+def kpi(col, icon, label, value, sub="", tone="blue", bar=None):            # one coloured KPI card
+    a, z = TONES[tone]                                                      # gradient colours
+    meter = f'<div class="bar"><div style="width:{min(max(bar, 0), 100):.0f}%"></div></div>' if bar is not None else ""  # optional progress bar
+    col.markdown(f'''<div class="kpi" style="background: linear-gradient(135deg, {a}, {z});">
+      <div class="top"><div class="label">{label}</div><div class="icon">{icon}</div></div>
+      <div class="value">{value}</div><div class="sub">{sub}</div>{meter}</div>''', unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------ data (cached: runs once per session)
@@ -88,8 +117,9 @@ delivered = sales[sales["is_cancelled"] == 0]                               # de
 policy = reorder_policy(moves)                                              # reorder status per item
 
 # ------------------------------------------------------------------ header and sidebar
-st.title("💊 Pharmaceutical Operations Intelligence System")                # page title
-st.caption("Batch quality, equipment maintenance, process control, sales, demand and inventory — LAL data, 2007–2026")
+st.markdown('''<div class="banner"><h1>💊 Pharmaceutical Operations Intelligence System</h1>
+<p>Batch quality · equipment maintenance · process control · sales · demand · inventory — LAL data, 2007–2026</p></div>''',
+            unsafe_allow_html=True)                                         # page banner
 yr = st.sidebar.slider("Production years", 2007, 2026, (2007, 2026))       # year filter for quality tabs
 sections = st.sidebar.multiselect("Manufacturing section", sorted(batches["manufacturing_section"].unique()),
                                   default=sorted(batches["manufacturing_section"].unique()))  # section filter
@@ -102,12 +132,14 @@ tab = st.tabs(["Overview", "Sales", "Batch quality", "Equipment", "Process contr
 
 # ------------------------------------------------------------------ 1. overview
 with tab[0]:
-    c = st.columns(5)                                                       # five headline numbers
-    c[0].metric("Batches", f"{len(b):,}")                                  # batches in the filter
-    c[1].metric("Failure rate", f"{b['batch_failed'].mean():.2%}")          # share failed
-    c[2].metric("Net sales (KES bn)", f"{delivered['Net_Amount_Excl_VAT_KES'].sum() / 1e9:.1f}")  # revenue
-    c[3].metric("Unpaid (KES m)", f"{delivered['Balance_Due_KES'].sum() / 1e6:,.0f}")  # outstanding balances
-    c[4].metric("Items overstocked", f"{(policy['status'] == 'Overstock').sum():,} / {len(policy):,}")  # stock problem
+    fr, over = b["batch_failed"].mean(), (policy["status"] == "Overstock").mean()  # failure rate, overstock share
+    paid = 1 - delivered["Balance_Due_KES"].sum() / delivered["Total_Amount_KES"].sum()  # share of invoiced value collected
+    c = st.columns(5)                                                       # five headline cards
+    kpi(c[0], "🧪", "Batches", f"{len(b):,}", f"{1 - fr:.1%} passed QC", "blue", bar=(1 - fr) * 100)
+    kpi(c[1], "⚠️", "Failure rate", f"{fr:.2%}", f"{b['batch_failed'].sum():,} failed batches", "red" if fr > 0.035 else "orange")
+    kpi(c[2], "💰", "Net sales", f"KES {delivered['Net_Amount_Excl_VAT_KES'].sum() / 1e9:.1f} bn", f"{len(delivered):,} delivered orders", "green")
+    kpi(c[3], "🧾", "Unpaid balances", f"KES {delivered['Balance_Due_KES'].sum() / 1e6:,.0f} m", f"{paid:.1%} of invoiced value collected", "purple", bar=paid * 100)
+    kpi(c[4], "📦", "Overstocked items", f"{(policy['status'] == 'Overstock').sum():,}", f"{over:.0%} of {len(policy):,} items", "teal", bar=over * 100)
     left, right = st.columns([3, 2])                                        # text and chart
     left.subheader("Bottom line")
     left.markdown("""
@@ -161,10 +193,13 @@ with tab[1]:
 
 # ------------------------------------------------------------------ 3. batch quality
 with tab[2]:
-    c = st.columns(3)                                                       # three headline numbers
-    c[0].metric("Batches", f"{len(b):,}")
-    c[1].metric("Failed", f"{b['batch_failed'].sum():,}")
-    c[2].metric("Failure rate", f"{b['batch_failed'].mean():.2%}")
+    crit = b.loc[b["maintenance_status"] == "Critical", "batch_failed"].mean()  # failure rate on Critical equipment
+    top2 = b["failure_mode"].value_counts(normalize=True).head(2).sum()     # share of the two largest modes
+    c = st.columns(4)                                                       # four headline cards
+    kpi(c[0], "🧪", "Batches", f"{len(b):,}", f"{yr[0]}–{yr[1]}", "blue")
+    kpi(c[1], "❌", "Failed", f"{b['batch_failed'].sum():,}", f"{b['batch_failed'].mean():.2%} of batches", "red")
+    kpi(c[2], "🔧", "Critical equipment", f"{crit:.1%}" if pd.notna(crit) else "–", "failure rate when Critical", "orange")
+    kpi(c[3], "📊", "Top 2 failure modes", f"{top2:.0%}", "of all failures", "purple", bar=top2 * 100)
     factor = st.selectbox("Failure rate by", ["maintenance_status", "age_band", "operator_band", "dosage_form",
                                               "manufacturing_section", "equipment_id", "drug_name"])  # grouping column
     st.altair_chart(rate_chart(b, factor, f"Failure rate by {factor} (dashed: average)"), width="stretch")
@@ -256,11 +291,12 @@ with tab[5]:
                          dosage_form=dosage, manufacturing_section=section)  # the user's inputs
         p = model.predict_proba(build_features(row))[0, 1]                  # probability of failure
         past = model.predict_proba(build_features(train))[:, 1]             # scores of past batches
-        c = st.columns(4)
-        c[0].metric("Risk score", f"{p:.2f}", f"{p / past.mean():.1f}× average")   # result vs average
-        c[1].metric("Alert threshold", f"{thr:.2f}")                        # 80%-recall threshold
-        c[2].metric("Flag", "⚠️ Extra checks" if p >= thr else "✅ Standard")  # decision
-        c[3].metric("Riskier than", f"{(past < p).mean():.0%} of past batches")  # position among past batches
+        c = st.columns(4)                                                   # four result cards
+        kpi(c[0], "🎯", "Risk score", f"{p:.2f}", f"{p / past.mean():.1f}× the average batch", "red" if p >= thr else "green", bar=p * 100)
+        kpi(c[1], "📏", "Alert threshold", f"{thr:.2f}", "set for 80% recall", "blue", bar=thr * 100)
+        kpi(c[2], "🚦", "Decision", "Extra checks" if p >= thr else "Standard", "above threshold" if p >= thr else "below threshold",
+            "orange" if p >= thr else "teal")
+        kpi(c[3], "📈", "Riskier than", f"{(past < p).mean():.0%}", "of past batches", "purple", bar=(past < p).mean() * 100)
     st.subheader("What the model weighs (standardised coefficients)")
     coef = pd.Series(model[-1].coef_.ravel(), index=build_features(train.head(1)).columns).rename(FEATURE_LABELS)  # push on log-odds
     cf = coef.reindex(coef.abs().sort_values(ascending=False).index).head(12).reset_index()
@@ -286,10 +322,13 @@ with tab[6]:
         hw = _holt_winters(series.to_numpy(), 12)                           # Holt-Winters, next 12 months
     future = pd.Series(hw,                                                  # forecast with month labels
                        index=pd.date_range(series.index[-1] + pd.offsets.MonthBegin(), periods=12, freq="MS"))
-    c = st.columns(3)                                                       # headline numbers
-    c[0].metric("Next 12 months (units)", f"{future.sum():,.0f}")
-    c[1].metric("Last 12 months (units)", f"{series.iloc[-12:].sum():,.0f}")
-    c[2].metric("Holt-Winters gain vs baseline", f"{acc['WAPE_improvement_vs_baseline'].iloc[-1]:.1%}")
+    growth = future.sum() / series.iloc[-12:].sum() - 1                     # expected change vs last year
+    gain = acc["WAPE_improvement_vs_baseline"].iloc[-1]                     # Holt-Winters vs seasonal naive
+    c = st.columns(4)                                                       # four headline cards
+    kpi(c[0], "🔮", "Next 12 months", f"{future.sum():,.0f}", "units forecast", "blue")
+    kpi(c[1], "🗓️", "Last 12 months", f"{series.iloc[-12:].sum():,.0f}", "units sold", "teal")
+    kpi(c[2], "📈" if growth >= 0 else "📉", "Expected change", f"{growth:+.1%}", "next year vs last year", "green" if growth >= 0 else "red")
+    kpi(c[3], "🏆", "Forecast gain", f"{gain:.1%}", f"WAPE {acc['WAPE'].iloc[-1]:.1%} vs {acc['WAPE'].iloc[0]:.1%} baseline", "purple", bar=gain * 100)
     st.subheader("History and 12-month forecast")
     st.line_chart(pd.DataFrame({"Actual": series, "Forecast (Holt-Winters)": future}), color=[BLUE, ORANGE])
     st.subheader("Back-test on the last 12 months")
@@ -311,9 +350,11 @@ with tab[7]:
     ct = c[1].multiselect("Category", sorted(policy["category"].dropna().unique()),
                           default=sorted(policy["category"].dropna().unique()))
     p = policy[policy["Branch_Code"].isin(br) & policy["category"].isin(ct)]  # filtered items
-    k = st.columns(4)                                                       # counts per action
-    for col, s in zip(k, ["Reorder now", "Overstock", "No recent demand", "OK"]):
-        col.metric(s, f"{(p['status'] == s).sum():,}")
+    k = st.columns(4)                                                       # one card per action
+    for col, (s, icon, tone) in zip(k, [("Reorder now", "🛒", "red"), ("Overstock", "📦", "orange"),
+                                        ("No recent demand", "💤", "purple"), ("OK", "✅", "green")]):
+        n = (p["status"] == s).sum()                                        # items with this action
+        kpi(col, icon, s, f"{n:,}", f"{n / max(len(p), 1):.0%} of {len(p):,} items", tone, bar=n / max(len(p), 1) * 100)
     c = st.columns(2)                                                       # two charts
     st_counts = p.groupby(["category", "status"]).size().reset_index(name="items")  # items per category and action
     c[0].altair_chart(alt.Chart(st_counts).mark_bar().encode(
