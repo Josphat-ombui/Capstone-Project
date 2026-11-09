@@ -1,3 +1,4 @@
 .DS_Store
 .ipynb_checkpoints/
 MY AUDIO.mp3
+__pycache__/
