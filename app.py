@@ -340,6 +340,309 @@ def exec_commercial(sales, moves, tn):                                      # co
                "credit-account balances are the two biggest cash levers; see the Commercial & finance view for detail.")
 
 
+# ------------------------------------------------------------------ what-if predictor (enter values, see the predicted outcome)
+from sklearn.compose import make_column_transformer                         # treat text and number inputs differently
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor  # tree models
+from sklearn.impute import SimpleImputer as _Imputer                        # fill gaps
+from sklearn.linear_model import LogisticRegression as _Logit               # failure-risk model
+from sklearn.metrics import f1_score, mean_absolute_error, roc_auc_score    # how good each model is
+from sklearn.model_selection import train_test_split                        # hold-out test set
+from sklearn.pipeline import make_pipeline as _pipe                         # chain the steps
+from sklearn.preprocessing import OneHotEncoder, StandardScaler as _Scaler  # encode text, scale numbers
+
+P_NUM = ["batch_size", "production_hours", "target_yield", "temp_avg", "temp_variance", "pressure_avg", "pressure_variance",
+         "humidity_avg", "raw_material_quality", "equipment_age_years", "maintenance_days_ago", "operator_experience_years"]
+P_CAT = ["manufacturing_section", "dosage_form", "maintenance_status"]
+S_NUM = ["equipment_age_years", "maintenance_days_ago", "operator_experience_years", "batch_size", "production_hours"]
+S_CAT = ["manufacturing_section"]
+LABELS = {"batch_size": "Batch size", "production_hours": "Production hours", "target_yield": "Target yield (%)",
+          "temp_avg": "Average temperature (°C)", "temp_variance": "Temperature variance", "pressure_avg": "Average pressure",
+          "pressure_variance": "Pressure variance", "humidity_avg": "Average humidity (%)", "raw_material_quality": "Raw material quality",
+          "equipment_age_years": "Equipment age (years)", "maintenance_days_ago": "Days since maintenance",
+          "operator_experience_years": "Operator experience (years)"}
+
+
+def _prep(num, cat, scale=False):                                           # imputing, encoding (and scaling) step
+    num_steps = [_Imputer(strategy="median")] + ([_Scaler()] if scale else [])
+    return make_column_transformer((_pipe(*num_steps), num),
+                                   (_pipe(_Imputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), cat))
+
+
+@st.cache_resource(show_spinner="Training the what-if models (about 30 seconds, once)...")
+def whatif_models(_df, target, key):                                        # key names the dataset for the cache
+    df = _df.dropna(subset=["maintenance_status"])
+    X, y = df[P_NUM + P_CAT], df[target]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)  # 80/20 split
+    risk = _pipe(_prep(P_NUM, P_CAT, scale=True), _Logit(class_weight="balanced", max_iter=2000)).fit(Xtr, ytr)  # failure risk
+    yv = df["actual_yield"]
+    ytr_y, yte_y = yv.loc[Xtr.index], yv.loc[Xte.index]
+    ymodel = _pipe(_prep(P_NUM, P_CAT), RandomForestRegressor(n_estimators=120, max_depth=14, min_samples_leaf=5,
+                                                               n_jobs=-1, random_state=42)).fit(Xtr[ytr_y.notna()], ytr_y.dropna())
+    ok = yte_y.notna()
+    scores = {"risk_auc": roc_auc_score(yte, risk.predict_proba(Xte)[:, 1]),                  # failure model ranking quality
+              "yield_mae": mean_absolute_error(yte_y[ok], ymodel.predict(Xte[ok])),           # average yield error
+              "yield_base": mean_absolute_error(yte_y[ok], np.repeat(ytr_y.mean(), ok.sum()))}
+    train_risk = risk.predict_proba(Xtr)[:, 1]                              # past scores, for the risk bands
+    return risk, ymodel, scores, np.percentile(train_risk, [50, 90]), train_risk.mean()
+
+
+def predictor_tab(df, target, key, pal, tn, sales, moves, policy):          # the What-if predictor view
+    c1, c2, c3, grey = pal
+    risk, ymodel, scores, (p50, p90), avg_risk = whatif_models(df, target, key)
+    part = st.radio("What do you want to predict?", ["Batch outcome", "Equipment maintenance status", "Stock and reorder",
+                                                     "Price and discount scenario"], horizontal=True, key=f"wi_{key}")
+    q = lambda col, p: float(np.nanpercentile(df[col], p))                  # a percentile of a column, for input limits
+    med = lambda col: float(df[col].median())
+
+    if part == "Batch outcome":
+        st.caption(f"Enter a planned batch. Failure risk: logistic regression (test ROC-AUC {scores['risk_auc']:.2f}, a weak signal). "
+                   f"Yield: random forest (test MAE {scores['yield_mae']:.2f} points vs {scores['yield_base']:.2f} for the average).")
+        c = st.columns(3)
+        v = {"manufacturing_section": c[0].selectbox("Manufacturing section", sorted(df["manufacturing_section"].unique()), key=f"s_{key}"),
+             "dosage_form": c[0].selectbox("Dosage form", sorted(df["dosage_form"].unique()), key=f"d_{key}"),
+             "maintenance_status": c[0].selectbox("Maintenance status", ["Current", "Due Soon", "Critical"], key=f"m_{key}")}
+        for i, col in enumerate(P_NUM):                                      # one number box per input, prefilled with the median
+            v[col] = c[(i % 2) + 1].number_input(LABELS[col], q(col, 0.5), q(col, 99.5), round(med(col), 2), key=f"n_{col}_{key}")
+        row = pd.DataFrame([v])
+        p, yl = risk.predict_proba(row)[0, 1], ymodel.predict(row)[0]
+        band = "High" if p >= p90 else ("Medium" if p >= p50 else "Low")
+        k = st.columns(4)
+        kpi(k[0], "🎯", "Failure risk score", f"{p:.2f}", f"{p / avg_risk:.1f}× the average batch", {"High": tn[2], "Medium": tn[5], "Low": tn[1]}[band], bar=p * 100)
+        kpi(k[1], "🚦", "Risk band", band, "High = top 10% of past batches", {"High": tn[2], "Medium": tn[5], "Low": tn[1]}[band])
+        kpi(k[2], "⚗️", "Predicted yield", f"{yl:.2f}%", f"target {v['target_yield']:.2f}%", tn[0])
+        gap = yl - v["target_yield"]
+        kpi(k[3], "📏", "Yield vs target", f"{gap:+.2f} pts", "above target" if gap >= 0 else "below target", tn[1] if gap >= 0 else tn[2])
+        st.markdown("**See how the prediction moves when you change one input** (all other inputs stay as entered)")
+        vary = st.selectbox("Input to vary", [LABELS[c] for c in P_NUM] + ["Maintenance status"], key=f"vary_{key}")
+        if vary == "Maintenance status":
+            grid = pd.concat([row.assign(maintenance_status=s) for s in ["Current", "Due Soon", "Critical"]], ignore_index=True)
+            xs = ["Current", "Due Soon", "Critical"]
+        else:
+            col = next(c for c in P_NUM if LABELS[c] == vary)
+            xs = np.linspace(q(col, 2), q(col, 98), 25)
+            grid = pd.concat([row] * len(xs), ignore_index=True)
+            grid[col] = xs
+        curve = pd.DataFrame({"value": xs, "Failure risk score": risk.predict_proba(grid)[:, 1], "Predicted yield (%)": ymodel.predict(grid)})
+        cc = st.columns(2)
+        for col_, measure, colour in [(cc[0], "Failure risk score", c3), (cc[1], "Predicted yield (%)", c1)]:
+            ch = alt.Chart(curve).mark_line(point=True, color=colour).encode(
+                x=alt.X("value:" + ("N" if vary == "Maintenance status" else "Q"), title=vary, sort=None),
+                y=alt.Y(f"{measure}:Q", scale=alt.Scale(zero=False)), tooltip=["value", alt.Tooltip(f"{measure}:Q", format=".3f")])
+            col_.altair_chart(ch.properties(height=260, title=measure), width="stretch")
+
+    elif part == "Equipment maintenance status":
+        lim = df.groupby("maintenance_status")["maintenance_days_ago"].agg(["min", "max"])  # the service rule seen in the data
+        due, crit = int(lim.loc["Due Soon", "min"]), int(lim.loc["Critical", "min"])
+        st.caption(f"In this data the status follows the service schedule exactly: Current up to {due - 1} days since the last service, "
+                   f"Due Soon from {due} days, Critical from {crit} days. Enter a machine's details to see its status and risk.")
+        c = st.columns(3)
+        days = c[0].number_input("Days since maintenance", 0, 400, 60, key=f"ed_{key}")
+        age = c[1].number_input("Equipment age (years)", 0.0, 40.0, round(med("equipment_age_years"), 1), key=f"ea_{key}")
+        sec = c[2].selectbox("Manufacturing section", sorted(df["manufacturing_section"].unique()), key=f"es_{key}")
+        pred = "Critical" if days >= crit else ("Due Soon" if days >= due else "Current")
+        nxt = (due - days) if pred == "Current" else ((crit - days) if pred == "Due Soon" else 0)
+        hist = df.groupby("maintenance_status")[target].mean()              # failure rate seen for each status
+        near = df[(df["manufacturing_section"] == sec) & (df["equipment_age_years"].sub(age).abs() <= 2)]  # similar machines
+        tone = {"Current": tn[1], "Due Soon": tn[5], "Critical": tn[2]}
+        k = st.columns(4)
+        kpi(k[0], "🔧", "Status", pred, f"{days} days since the last service", tone[pred])
+        kpi(k[1], "⏱️", "Days to next stage", "now" if pred == "Critical" else f"{nxt}",
+            "Critical: service immediately" if pred == "Critical" else ("until Due Soon" if pred == "Current" else "until Critical"), tone[pred])
+        kpi(k[2], "⚠️", "Failure rate at this status", f"{hist[pred]:.1%}", f"vs {hist['Current']:.1%} when Current", tone[pred])
+        kpi(k[3], "🏭", "Similar machines", f"{near[target].mean():.1%}" if len(near) else "–",
+            f"failure rate, {sec}, age ±2 years ({len(near):,} batches)", tn[4])
+        bins = pd.cut(df["maintenance_days_ago"], range(0, 200, 10))       # 10-day bands
+        fr = df.groupby(bins, observed=True)[target].agg(rate="mean", batches="size").reset_index()
+        fr["days"] = fr["maintenance_days_ago"].apply(lambda b: b.left + 5)
+        fr["rate"] *= 100
+        bars = alt.Chart(fr).mark_bar(color=c1, opacity=0.8).encode(
+            x=alt.X("days:Q", title="Days since maintenance"), y=alt.Y("rate:Q", title="Failure rate (%)"),
+            tooltip=["days", alt.Tooltip("rate:Q", format=".2f"), "batches"])
+        marks = alt.Chart(pd.DataFrame({"x": [due, crit], "label": ["Due Soon", "Critical"]})).mark_rule(color=c3, strokeDash=[5, 3]).encode(x="x:Q")
+        you = alt.Chart(pd.DataFrame({"x": [days]})).mark_rule(color="black", strokeWidth=3).encode(x="x:Q")
+        st.altair_chart((bars + marks + you).properties(height=280, title="Failure rate by days since maintenance (black line = your machine)"),
+                        width="stretch")
+
+    elif part == "Stock and reorder":
+        pol = policy.rename(columns=str.lower)                              # one naming style for both dashboards
+        c = st.columns(2)
+        br = c[0].selectbox("Branch", sorted(pol["branch_code"].unique()), key=f"rb_{key}")
+        pid = c[1].selectbox("Product", sorted(pol.loc[pol["branch_code"] == br, "product_id"]), key=f"rp_{key}")
+        it = pol[(pol["branch_code"] == br) & (pol["product_id"] == pid)].iloc[0]
+        st.caption(f"Prefilled from the data for {pid} ({it['category']}) at {br}: change any value to test a scenario.")
+        c = st.columns(5)
+        stock = c[0].number_input("Stock on hand (units)", 0.0, 1e7, float(max(it["stock_now"], 0)), key=f"rs_{key}")
+        wk = c[1].number_input("Average weekly demand", 0.0, 1e5, float(it["avg_weekly"]), key=f"rw_{key}")
+        sd = c[2].number_input("Weekly demand spread (SD)", 0.0, 1e5, float(it["sd_weekly"]), key=f"rd_{key}")
+        lead = c[3].number_input("Lead time (days)", 1, 120, 14, key=f"rl_{key}")
+        cover = c[4].number_input("Cover to order up to (weeks)", 1, 52, 8, key=f"rc_{key}")
+        z = 1.65                                                            # 95% service level
+        daily = wk / 7
+        safety = z * sd / np.sqrt(7) * np.sqrt(lead)                         # buffer for the lead time
+        rop = daily * lead + safety                                         # reorder point
+        days = stock / daily if daily > 0 else np.inf                       # days until stock runs out
+        order = max(0.0, rop + cover * wk - stock)                          # order up to reorder point + cover
+        status = "No demand" if daily == 0 else ("Reorder now" if stock <= rop else ("Overstock" if days > 180 else "OK"))
+        k = st.columns(4)
+        kpi(k[0], "📅", "Days of cover", "∞" if np.isinf(days) else f"{days:,.0f}", "at the entered demand", tn[0])
+        kpi(k[1], "📍", "Reorder point", f"{rop:,.0f}", f"incl. safety stock {safety:,.0f}", tn[4])
+        kpi(k[2], "🛒", "Suggested order", f"{order:,.0f} units", f"to cover lead time + {cover} weeks", tn[5])
+        kpi(k[3], "🚦", "Status", status, "95% service level", {"Reorder now": tn[2], "Overstock": tn[5], "OK": tn[1]}.get(status, tn[3]))
+        weeks = np.arange(0, 27)
+        proj = pd.DataFrame({"week": weeks, "Stock if no order": np.maximum(stock - wk * weeks, 0),
+                             "Reorder point": rop})
+        st.line_chart(proj.set_index("week"), color=[c1, c3])
+        st.caption("Projected stock over the next 26 weeks at the entered demand, against the reorder point.")
+
+    else:
+        d, _, _ = finance_tables(sales, moves)
+        cat = st.selectbox("Category", ["All"] + sorted(d["product_category"].unique()), key=f"pc_{key}")
+        base = d[d["month"] > d["month"].max() - pd.DateOffset(months=12)]   # last 12 months as the base
+        base = base if cat == "All" else base[base["product_category"] == cat]
+        R, C = base["net_amount_excl_vat_kes"].sum(), base["cogs_kes"].sum()  # base revenue and cost
+        c = st.columns(4)
+        price = c[0].slider("Price change (%)", -30, 30, 0, key=f"pp_{key}")
+        disc = c[1].slider("Extra discount (points)", -5, 15, 0, key=f"pd_{key}")
+        vol = c[2].slider("Volume change (%)", -50, 50, 0, key=f"pv_{key}")
+        cost = c[3].slider("Unit cost change (%)", -20, 30, 0, key=f"pk_{key}")
+        R2 = R * (1 + price / 100) * (1 - disc / 100) * (1 + vol / 100)     # scenario revenue
+        C2 = C * (1 + cost / 100) * (1 + vol / 100)                         # scenario cost
+        G, G2 = R - C, R2 - C2
+        per_unit = R * (1 + price / 100) * (1 - disc / 100) - C * (1 + cost / 100)  # margin per base volume
+        be = (G / per_unit - 1) * 100 if per_unit > 0 else np.nan            # volume change that keeps gross profit flat
+        k = st.columns(4)
+        kpi(k[0], "💰", "Revenue (12 months)", f"KES {R2 / 1e6:,.0f} m", f"{R2 / R - 1:+.1%} vs KES {R / 1e6:,.0f} m", tn[0])
+        kpi(k[1], "📈", "Gross profit", f"KES {G2 / 1e6:,.0f} m", f"{G2 / G - 1:+.1%} vs KES {G / 1e6:,.0f} m", tn[1] if G2 >= G else tn[2])
+        kpi(k[2], "📊", "Gross margin", f"{G2 / R2:.1%}" if R2 else "–", f"base {G / R:.1%}", tn[4])
+        kpi(k[3], "⚖️", "Break-even volume change", "n/a" if np.isnan(be) else f"{be:+.1f}%",
+            "needed to keep gross profit flat", tn[5])
+        cmp = pd.DataFrame({"case": ["Base", "Base", "Scenario", "Scenario"], "measure": ["Revenue", "Gross profit"] * 2,
+                            "kes_m": [R / 1e6, G / 1e6, R2 / 1e6, G2 / 1e6]})
+        st.altair_chart(alt.Chart(cmp).mark_bar().encode(
+            x=alt.X("measure:N", title=None), xOffset="case:N", y=alt.Y("kes_m:Q", title="KES million"),
+            color=alt.Color("case:N", scale=alt.Scale(range=[grey, c1])), tooltip=["case", "measure", alt.Tooltip("kes_m:Q", format=",.0f")])
+            .properties(height=280, title="Last 12 months: base vs your scenario"), width="stretch")
+        st.caption("Simple arithmetic on the last 12 months, with no price elasticity: set the volume change you expect from the price "
+                   "or discount change yourself.")
+
+
+# ------------------------------------------------------------------ executive summary: how the features drove the findings
+def _clean(name):                                                           # readable feature names from the model pipeline
+    n = name.split("__", 1)[-1]
+    for cat in P_CAT:
+        if n.startswith(cat + "_"):
+            return f"{cat.replace('_', ' ').capitalize()}: {n[len(cat) + 1:]}"
+    return LABELS.get(n, n)
+
+
+def _band_effect(df, target, col, label):                                   # failure rate in the lowest vs highest quarter
+    lo, hi = df[col].quantile([0.25, 0.75])
+    a, b = df.loc[df[col] <= lo, target].mean(), df.loc[df[col] >= hi, target].mean()
+    return [label, f"≤ {lo:,.1f}", f"{a:.2%}", f"≥ {hi:,.1f}", f"{b:.2%}", (b - a) * 100]
+
+
+def exec_drivers(df, target, key, pal, tn):
+    c1, c2, c3, grey = pal
+    risk, ymodel, scores, _, _ = whatif_models(df, target, key)             # the same models as the What-if tab
+    st.subheader("How the features drove each finding")
+    st.caption("Every number below is computed from the 60,000 batches; model weights come from the models in the What-if predictor tab.")
+
+    # ---- A. batch failure
+    st.markdown("#### A. Why do batches fail? — the drivers of failure risk")
+    names = [_clean(n) for n in risk[0].get_feature_names_out()]
+    coef = pd.Series(risk[-1].coef_.ravel(), index=names)                   # push on the log-odds per standard deviation / category
+    top = coef.reindex(coef.abs().sort_values(ascending=False).index).head(12).reset_index()
+    top.columns = ["feature", "weight"]
+    top["direction"] = np.where(top["weight"] > 0, "raises risk", "lowers risk")
+    c = st.columns([3, 2])
+    c[0].altair_chart(alt.Chart(top).mark_bar().encode(
+        y=alt.Y("feature:N", sort=None, title=None), x=alt.X("weight:Q", title="Effect on the odds of failure (model weight)"),
+        color=alt.Color("direction:N", scale=alt.Scale(domain=["raises risk", "lowers risk"], range=[c3, c1]), title=None),
+        tooltip=["feature", alt.Tooltip("weight:Q", format=".3f"), "direction"]).properties(height=340), width="stretch")
+    rate = df.groupby("maintenance_status")[target].mean()
+    age_band = pd.cut(df["equipment_age_years"], [-1, 5, 10, 100], labels=["0–5 years", "5–10 years", "over 10 years"])
+    exp_band = pd.cut(df["operator_experience_years"], [-1, 2, 5, 10, 100], labels=["0–2", "3–5", "6–10", "over 10"])
+    ar, er = df.groupby(age_band, observed=True)[target].mean(), df.groupby(exp_band, observed=True)[target].mean()
+    c[1].markdown(f"""
+- **Maintenance status** is the clearest single driver: Critical batches fail at **{rate['Critical']:.1%}**, more than double
+  Current (**{rate['Current']:.1%}**). Due Soon ({rate['Due Soon']:.1%}) is no worse than Current.
+- **Equipment age** raises risk steadily: **{ar.iloc[0]:.1%}** on machines up to 5 years old vs **{ar.iloc[-1]:.1%}** over 10 years.
+- **Operator experience** protects: operators with 0–2 years fail **{er.iloc[0]:.1%}** of batches, those with over 10 years **{er.iloc[-1]:.1%}**.
+- **Dosage form** matters through product difficulty: {", ".join(f"{k} ({v:.1%})" for k, v in df.groupby("dosage_form")[target].mean().nlargest(3).items())}
+  have the highest failure rates.
+- Process readings (temperature, pressure, humidity) carry **small weights**: they stay inside limits on almost every batch, which is
+  why failure cannot be predicted well (test ROC-AUC {scores['risk_auc']:.2f}).""")
+    eff = pd.DataFrame([_band_effect(df, target, col, LABELS[col]) for col in
+                        ["equipment_age_years", "operator_experience_years", "maintenance_days_ago", "raw_material_quality",
+                         "temp_variance", "production_hours", "batch_size"]],
+                       columns=["Feature", "Lowest 25%", "Failure rate", "Highest 25%", "Failure rate ", "Difference (points)"])
+    st.markdown("**Failure rate in the lowest vs highest quarter of each feature**")
+    st.dataframe(eff.sort_values("Difference (points)", key=abs, ascending=False).round(2), hide_index=True, width="stretch")
+
+    # ---- B. yield
+    st.markdown("#### B. What sets the yield? — drivers of the yield model")
+    imp = pd.Series(ymodel[-1].feature_importances_, index=[_clean(n) for n in ymodel[0].get_feature_names_out()])
+    imp = imp.groupby(lambda n: n.split(":")[0]).sum().sort_values(ascending=False).head(10)  # one bar per feature (categories summed)
+    yi = (imp / imp.sum() * 100).reset_index()
+    yi.columns = ["feature", "share"]
+    c = st.columns([3, 2])
+    c[0].altair_chart(alt.Chart(yi).mark_bar(color=c1).encode(
+        y=alt.Y("feature:N", sort="-x", title=None), x=alt.X("share:Q", title="Share of the model's importance (%)"),
+        tooltip=["feature", alt.Tooltip("share:Q", format=".1f")]).properties(height=300), width="stretch")
+    lead = yi["feature"].iloc[0]
+    c[1].markdown(f"""
+- **{lead}** carries **{yi['share'].iloc[0]:.0f}%** of the yield model's importance, followed by **{yi['feature'].iloc[1]}** and
+  **{yi['feature'].iloc[2]}**.
+- The model predicts yield within **{scores['yield_mae']:.2f} points** on average, against {scores['yield_base']:.2f} points
+  for simply using the plant average: **{(1 - scores['yield_mae'] / scores['yield_base']):.0%} better**.
+- Planning can therefore estimate output per batch before production starts, even though pass/fail cannot be predicted.""")
+
+    # ---- C. rise since 2019
+    st.markdown("#### C. Why did failures rise after 2019? — ageing equipment")
+    yr = df.groupby("year").agg(failure_rate=(target, "mean"),
+                                old_share=("equipment_age_years", lambda s: (s > 10).mean())).reset_index()
+    yr[["failure_rate", "old_share"]] *= 100
+    base = alt.Chart(yr).encode(x=alt.X("year:O", title=None))
+    c = st.columns([3, 2])
+    c[0].altair_chart(alt.layer(
+        base.mark_area(color=grey, opacity=0.35).encode(y=alt.Y("old_share:Q", title="Batches on equipment over 10 years old (%)")),
+        base.mark_line(color=c3, point=True).encode(y=alt.Y("failure_rate:Q", title="Failure rate (%)"),
+                                                    tooltip=["year", alt.Tooltip("failure_rate:Q", format=".2f"), alt.Tooltip("old_share:Q", format=".0f")]))
+        .resolve_scale(y="independent").properties(height=300), width="stretch")
+    early, late = yr[yr["year"].between(2014, 2018)], yr[yr["year"].between(2020, 2025)]
+    c[1].markdown(f"""
+- The share of batches made on equipment **over 10 years old** rose from **{early['old_share'].mean():.0f}%** (2014–18) to
+  **{late['old_share'].mean():.0f}%** (2020–25).
+- Over the same periods the failure rate rose from **{early['failure_rate'].mean():.2f}%** to **{late['failure_rate'].mean():.2f}%**.
+- The two lines move together: the rise is mainly an **ageing-fleet effect**, not a sudden process problem. Replacing or overhauling
+  the oldest machines is the lever.""")
+
+    # ---- D. what fixing the drivers would be worth
+    st.markdown("#### D. What acting on the drivers would be worth (estimate)")
+    years = df["year"].nunique()
+    crit = df[df["maintenance_status"] == "Critical"]
+    old = df[df["equipment_age_years"] > 10]
+    young_rate = df.loc[df["equipment_age_years"] <= 10, target].mean()
+    novice = df[df["operator_experience_years"] <= 2]
+    exp_rate = df.loc[df["operator_experience_years"] > 2, target].mean()
+    lever = pd.DataFrame([
+        ["Never run a batch on Critical equipment", f"{len(crit):,}", f"{crit[target].mean():.1%} → {rate['Current']:.1%}",
+         len(crit) * (crit[target].mean() - rate["Current"])],
+        ["Bring machines over 10 years to the younger fleet's failure rate", f"{len(old):,}", f"{old[target].mean():.1%} → {young_rate:.1%}",
+         len(old) * (old[target].mean() - young_rate)],
+        ["Pair operators with 0–2 years' experience with seniors", f"{len(novice):,}", f"{novice[target].mean():.1%} → {exp_rate:.1%}",
+         len(novice) * (novice[target].mean() - exp_rate)],
+    ], columns=["Action", "Batches affected (all years)", "Failure rate now → after", "Failed batches avoided (all years)"])
+    lever["Per year (average)"] = lever["Failed batches avoided (all years)"] / years
+    c = st.columns([2, 3])
+    c[0].altair_chart(alt.Chart(lever).mark_bar(color=c1).encode(
+        y=alt.Y("Action:N", sort="-x", title=None), x=alt.X("Per year (average):Q", title="Failed batches avoided per year"),
+        tooltip=["Action", alt.Tooltip("Per year (average):Q", format=".1f")]).properties(height=200), width="stretch")
+    c[1].dataframe(lever.round(1), hide_index=True, width="stretch")
+    st.caption("Estimates assume the affected batches would fail at the better group's rate; the actions overlap, so the savings should "
+               "not be added together.")
+
+
 batches, sales, moves = load_data()                                         # load once
 delivered = sales[sales["is_cancelled"] == 0]                               # delivered orders
 policy = reorder_policy(moves)                                              # reorder status per item
@@ -355,11 +658,12 @@ b = batches[batches["year"].between(*yr) & batches["manufacturing_section"].isin
 st.sidebar.markdown(f"**{len(b):,} batches selected**")                    # filter summary
 st.sidebar.caption("The filters apply to the Batch quality, Equipment and Process control tabs.")
 
-tab = st.tabs(["Overview", "Sales", "Batch quality", "Equipment", "Process control", "Risk checker",
-               "Demand forecast", "Inventory", "Commercial & finance", "Executive summary"])
+NAMES = ["Overview", "Sales", "Batch quality", "Equipment", "Process control", "Risk checker",
+         "What-if predictor", "Demand forecast", "Inventory", "Commercial & finance", "Executive summary"]
+T = dict(zip(NAMES, st.tabs(NAMES)))                                    # tabs addressed by name
 
 # ------------------------------------------------------------------ 1. overview
-with tab[0]:
+with T["Overview"]:
     fr, over = b["batch_failed"].mean(), (policy["status"] == "Overstock").mean()  # failure rate, overstock share
     paid = 1 - delivered["Balance_Due_KES"].sum() / delivered["Total_Amount_KES"].sum()  # share of invoiced value collected
     c = st.columns(5)                                                       # five headline cards
@@ -393,7 +697,7 @@ with tab[0]:
                  hide_index=True, width="stretch")
 
 # ------------------------------------------------------------------ 2. sales
-with tab[1]:
+with T["Sales"]:
     m = delivered.groupby(delivered["Sale_Date"].dt.to_period("M").dt.to_timestamp())["Net_Amount_Excl_VAT_KES"].sum() / 1e6
     st.subheader("Net sales per month (KES million)")
     st.area_chart(m.rename("Net sales (KES m)"), color=BLUE)               # monthly revenue
@@ -420,7 +724,7 @@ with tab[1]:
     st.dataframe(top.sort_values("net_sales_kes_m", ascending=False).head(10).round(2), width="stretch")
 
 # ------------------------------------------------------------------ 3. batch quality
-with tab[2]:
+with T["Batch quality"]:
     crit = b.loc[b["maintenance_status"] == "Critical", "batch_failed"].mean()  # failure rate on Critical equipment
     top2 = b["failure_mode"].value_counts(normalize=True).head(2).sum()     # share of the two largest modes
     c = st.columns(4)                                                       # four headline cards
@@ -451,7 +755,7 @@ with tab[2]:
                  width="stretch")
 
 # ------------------------------------------------------------------ 4. equipment
-with tab[3]:
+with T["Equipment"]:
     c = st.columns(2)                                                       # two charts
     c[0].altair_chart(rate_chart(b, "maintenance_status", "Failure rate by maintenance status"), width="stretch")
     c[1].altair_chart(rate_chart(b, "age_band", "Failure rate by equipment age", sort=None), width="stretch")
@@ -473,7 +777,7 @@ with tab[3]:
     st.dataframe(eq, width="stretch")
 
 # ------------------------------------------------------------------ 5. process control
-with tab[4]:
+with T["Process control"]:
     limits = control_limits(batches)                                        # limits from passed batches up to 2021
     flags = flag_out_of_control(b, limits)                                  # out-of-control flags for the filter
     st.subheader("Share of readings within control limits")
@@ -498,7 +802,7 @@ with tab[4]:
     st.dataframe(capability(b).round(3), hide_index=True, width="stretch")
 
 # ------------------------------------------------------------------ 6. risk checker
-with tab[5]:
+with T["Risk checker"]:
     model, thr, train = risk_model(batches)                                 # cached model
     st.caption("Chosen model: logistic regression (test ROC-AUC 0.58). Use it to target extra checks, not to release batches.")
     with st.form("risk"):                                                   # input form
@@ -540,7 +844,7 @@ with tab[5]:
                                "Test precision": [0.040, 0.039, 0.038]}), hide_index=True, width="stretch")
 
 # ------------------------------------------------------------------ 7. demand forecast
-with tab[6]:
+with T["Demand forecast"]:
     md = monthly_demand(sales)                                              # units per month by category
     cat = st.selectbox("Category", ["Total"] + [c for c in md.columns if c != "Total"])
     series = md[cat]                                                        # chosen series
@@ -572,7 +876,7 @@ with tab[6]:
     st.download_button("Download forecast (CSV)", future.rename("units").to_csv(), "forecast.csv")
 
 # ------------------------------------------------------------------ 8. inventory
-with tab[7]:
+with T["Inventory"]:
     c = st.columns(2)                                                       # two filters
     br = c[0].multiselect("Branch", sorted(policy["Branch_Code"].unique()), default=sorted(policy["Branch_Code"].unique()))
     ct = c[1].multiselect("Category", sorted(policy["category"].dropna().unique()),
@@ -609,11 +913,15 @@ with tab[7]:
     st.download_button("Download list (CSV)", p.to_csv(index=False), "reorder_policy.csv")
 
 # ------------------------------------------------------------------ 9. commercial and finance
-with tab[8]:
+with T["Commercial & finance"]:
     finance_page(sales, moves, (BLUE, "#52be80", ORANGE, GREY), ["green", "teal", "red", "purple", "blue", "orange"])
 
+# ------------------------------------------------------------------ what-if predictor
+with T["What-if predictor"]:
+    predictor_tab(batches, "batch_failed", "team", (BLUE, ORANGE, RED, GREY), ["blue", "green", "red", "purple", "teal", "orange"], sales, moves, policy)
+
 # ------------------------------------------------------------------ 10. executive summary
-with tab[9]:
+with T["Executive summary"]:
     st.markdown('''<div style="background:#eef5fb;border-left:6px solid #1f4e79;padding:14px 18px;border-radius:10px;margin-bottom:14px">
     <b>Bottom line.</b> Quality is high (96.9% of 60,000 batches pass) and failures are concentrated in assay and dissolution (47%).
     Overdue (Critical) maintenance more than doubles the odds of failure, and ageing equipment explains most of the rise since 2019.
@@ -651,6 +959,8 @@ with tab[9]:
          "PR-AUC 0.278 (205× random), 80% of stock-outs caught; 1,033 of 1,200 items overstocked, 128 to reorder", "Stock-outs can be flagged; over-buying is the bigger problem"],
     ], columns=["Question", "Model / method", "What we found", "Answer"])
     st.dataframe(qa, hide_index=True, width="stretch")
+
+    exec_drivers(batches, "batch_failed", "team", (BLUE, ORANGE, RED, GREY), ["blue", "green", "red", "purple", "teal", "orange"])
 
     st.subheader("Model scorecard: comparison, top features and choice for each problem")
     st.dataframe(pd.DataFrame([
