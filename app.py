@@ -541,11 +541,17 @@ def _band_effect(df, target, col, label):                                   # fa
     return [label, f"≤ {lo:,.1f}", f"{a:.2%}", f"≥ {hi:,.1f}", f"{b:.2%}", (b - a) * 100]
 
 
-def exec_drivers(df, target, key, pal, tn):
+def growth_driver(vol, price):                                              # which part of revenue growth dominates
+    if abs(vol - price) / max(vol, price) < 0.15:
+        return "volume and price contributed **almost equally**"
+    return "growth came mainly from **" + ("volume" if vol > price else "price") + "**"
+
+
+def exec_drivers(df, target, key, pal, tn, sales, moves, policy):
     c1, c2, c3, grey = pal
     risk, ymodel, scores, _, _ = whatif_models(df, target, key)             # the same models as the What-if tab
     st.subheader("How the features drove each finding")
-    st.caption("Every number below is computed from the 60,000 batches; model weights come from the models in the What-if predictor tab.")
+    st.caption("Every number below is computed live from the batch, sales and inventory data; model weights come from the What-if predictor models.")
 
     # ---- A. batch failure
     st.markdown("#### A. Why do batches fail? — the drivers of failure risk")
@@ -618,7 +624,74 @@ def exec_drivers(df, target, key, pal, tn):
   the oldest machines is the lever.""")
 
     # ---- D. what fixing the drivers would be worth
-    st.markdown("#### D. What acting on the drivers would be worth (estimate)")
+    # ---- D. sales: revenue and margin
+    st.markdown("#### D. What drives revenue and margin? — sales data")
+    d, _, _ = finance_tables(sales, moves)                                  # delivered orders with cost and gross profit
+    yr = d.groupby(d["sale_date"].dt.year.rename("year")).agg(revenue=("net_amount_excl_vat_kes", "sum"), units=("quantity", "sum"),
+                                                              gp=("gross_profit_kes", "sum"), orders=("sale_id", "size"))
+    yr["price_per_unit"] = yr["revenue"] / yr["units"]                       # average net price per unit sold
+    first, last_ = yr.iloc[0], yr.iloc[-1]
+    idx = (yr[["revenue", "units", "price_per_unit"]] / yr[["revenue", "units", "price_per_unit"]].iloc[0] * 100).reset_index()
+    idx = idx.rename(columns={"revenue": "Revenue", "units": "Units sold", "price_per_unit": "Net price per unit"}).melt("year", var_name="measure", value_name="index")
+    c = st.columns([3, 2])
+    c[0].altair_chart(alt.Chart(idx).mark_line(point=True).encode(
+        x=alt.X("year:O", title=None), y=alt.Y("index:Q", title=f"Index ({int(yr.index[0])} = 100)"),
+        color=alt.Color("measure:N", scale=alt.Scale(range=[c1, c3, grey]), title=None),
+        tooltip=["year", "measure", alt.Tooltip("index:Q", format=".0f")]).properties(height=300, title="Revenue growth = volume × price"),
+        width="stretch")
+    dm = d.groupby("discount_pct").agg(gp=("gross_profit_kes", "sum"), rev=("net_amount_excl_vat_kes", "sum"), units=("quantity", "median"))
+    dm["margin"] = dm["gp"] / dm["rev"] * 100
+    cm = d.groupby("product_category").agg(gp=("gross_profit_kes", "sum"), rev=("net_amount_excl_vat_kes", "sum"))
+    cm["margin"] = cm["gp"] / cm["rev"] * 100
+    unpaid = d.groupby("payment_method")["balance_due_kes"].sum()
+    c[1].markdown(f"""
+- Revenue grew **{last_['revenue'] / first['revenue']:.1f}×** from {int(yr.index[0])} to {int(yr.index[-1])}
+  (KES {first['revenue'] / 1e6:,.0f} m → {last_['revenue'] / 1e6:,.0f} m). Units sold grew **{last_['units'] / first['units']:.1f}×**
+  and the net price per unit **{last_['price_per_unit'] / first['price_per_unit']:.2f}×**, so
+  {growth_driver(last_['units'] / first['units'], last_['price_per_unit'] / first['price_per_unit'])}.
+- **Discounts cut margin:** {dm['margin'].iloc[0]:.1f}% with no discount vs {dm['margin'].iloc[-1]:.1f}% at {dm.index[-1]:g}% discount,
+  while the median order grows from {dm['units'].iloc[0]:.0f} to {dm['units'].iloc[-1]:.0f} units — a volume discount.
+- **Product mix:** margins range from {cm['margin'].min():.1f}% ({cm['margin'].idxmin()}) to {cm['margin'].max():.1f}% ({cm['margin'].idxmax()}).
+- **Unpaid balances come only from credit accounts** (KES {unpaid.get('Credit Account', 0) / 1e6:,.0f} m of
+  KES {unpaid.sum() / 1e6:,.0f} m): payment terms, not customers paying cash, drive receivables.""")
+    drv = pd.DataFrame([
+        ["Discount level", f"{dm.index[0]:g}%: {dm['margin'].iloc[0]:.1f}%", f"{dm.index[-1]:g}%: {dm['margin'].iloc[-1]:.1f}%",
+         abs(dm["margin"].iloc[-1] - dm["margin"].iloc[0])],
+        ["Product category", f"{cm['margin'].idxmin()}: {cm['margin'].min():.1f}%", f"{cm['margin'].idxmax()}: {cm['margin'].max():.1f}%",
+         cm["margin"].max() - cm["margin"].min()]], columns=["Driver of gross margin", "Low end", "High end", "Spread (points)"])
+    br = d.groupby("branch_code").agg(gp=("gross_profit_kes", "sum"), rev=("net_amount_excl_vat_kes", "sum"))
+    br["margin"] = br["gp"] / br["rev"] * 100
+    drv.loc[len(drv)] = ["Branch", f"{br['margin'].idxmin()}: {br['margin'].min():.1f}%", f"{br['margin'].idxmax()}: {br['margin'].max():.1f}%",
+                         br["margin"].max() - br["margin"].min()]
+    st.dataframe(drv.round(1), hide_index=True, width="stretch")
+
+    # ---- E. inventory: over-buying and stock-outs
+    st.markdown("#### E. What drives the stock problems? — inventory data")
+    m = moves.rename(columns=str.lower)
+    pol = policy.rename(columns=str.lower)
+    flow = pd.DataFrame({"received": m[m["quantity_change"] > 0].groupby("category" if "category" in m else "product_category")["quantity_change"].sum(),
+                         "sold": d.groupby("product_category")["quantity"].sum()})
+    flow["ratio"] = flow["received"] / flow["sold"]
+    c = st.columns([3, 2])
+    c[0].altair_chart(alt.Chart(flow.reset_index(names="category")).mark_bar().encode(
+        y=alt.Y("category:N", sort="-x", title=None), x=alt.X("ratio:Q", title="Units received per unit sold"),
+        color=alt.condition(alt.datum.ratio > 3, alt.value(c3), alt.value(c1)),
+        tooltip=["category", alt.Tooltip("ratio:Q", format=".2f"), alt.Tooltip("received:Q", format=","), alt.Tooltip("sold:Q", format=",")])
+        .properties(height=260, title="Receipts vs sales by category (red = over 3×)"), width="stretch")
+    stat = pol.groupby("status").agg(items=("product_id", "size"), median_weekly_demand=("avg_weekly", "median"),
+                                     median_stock=("stock_now", "median"), median_days_cover=("days_of_cover", "median"))
+    ro, ov = (stat.loc[s] if s in stat.index else None for s in ["Reorder now", "Overstock"])
+    c[1].markdown(f"""
+- **Over-buying is the driver of overstock:** every category receives more than it sells; **{flow['ratio'].idxmax()}** receives
+  **{flow['ratio'].max():.1f}×** what it sells, the others {flow.drop(flow['ratio'].idxmax())['ratio'].min():.1f}–{flow.drop(flow['ratio'].idxmax())['ratio'].max():.1f}×.
+- Receipts arrive in fixed lots regardless of demand, so slow items pile up: overstocked items hold a median
+  **{ov['median_days_cover']:,.0f} days** of cover.""" + (f"""
+- **Stock-outs come from fast movers:** items to reorder now sell a median **{ro['median_weekly_demand']:.1f} units a week**, against
+  {ov['median_weekly_demand']:.1f} for overstocked items — high demand, not low receipts, empties the shelf.""" if ro is not None else ""))
+    st.dataframe(stat.round(1), width="stretch")
+
+    st.markdown("#### F. What acting on the drivers would be worth (estimate)")
+    st.markdown("**Quality levers**")
     years = df["year"].nunique()
     crit = df[df["maintenance_status"] == "Critical"]
     old = df[df["equipment_age_years"] > 10]
@@ -641,6 +714,21 @@ def exec_drivers(df, target, key, pal, tn):
     c[1].dataframe(lever.round(1), hide_index=True, width="stretch")
     st.caption("Estimates assume the affected batches would fail at the better group's rate; the actions overlap, so the savings should "
                "not be added together.")
+    st.markdown("**Commercial levers (estimate, last 12 months)**")
+    last12 = d[d["month"] > d["month"].max() - pd.DateOffset(months=12)]
+    cap = last12[last12["discount_pct"] > 5]                                # orders discounted above 5%
+    disc_gain = (cap["gross_amount_kes"] * (cap["discount_pct"] - 5) / 100).sum()  # profit kept if discounts were capped at 5%
+    last_cost = m.groupby("product_id")["unit_cost_kes"].last()
+    excess_units = (pol["stock_now"] - 180 * pol["avg_weekly"] / 7).clip(lower=0)
+    excess_value = (excess_units * pol["product_id"].map(last_cost)).sum()  # stock value beyond 180 days of cover
+    old_debt = d.loc[(d["balance_due_kes"] > 0) & (d["age_days"] > 365), "balance_due_kes"].sum()
+    st.dataframe(pd.DataFrame([
+        ["Cap discounts at 5% (same volumes)", f"{len(cap):,} orders", f"KES {disc_gain / 1e6:,.1f} m more gross profit a year"],
+        ["Run stock down to 180 days of cover", f"{(excess_units > 0).sum():,} items", f"KES {excess_value / 1e9:,.1f} bn of cash released over time"],
+        ["Collect credit balances older than one year", "credit accounts", f"KES {old_debt / 1e6:,.0f} m of cash"],
+    ], columns=["Action", "Affects", "Value"]), hide_index=True, width="stretch")
+    st.caption("Discount estimate assumes volumes stay the same; stock release assumes surplus stock can be sold or returned at cost.")
+
 
 
 batches, sales, moves = load_data()                                         # load once
@@ -960,7 +1048,8 @@ with T["Executive summary"]:
     ], columns=["Question", "Model / method", "What we found", "Answer"])
     st.dataframe(qa, hide_index=True, width="stretch")
 
-    exec_drivers(batches, "batch_failed", "team", (BLUE, ORANGE, RED, GREY), ["blue", "green", "red", "purple", "teal", "orange"])
+    exec_drivers(batches, "batch_failed", "team", (BLUE, ORANGE, RED, GREY), ["blue", "green", "red", "purple", "teal", "orange"],
+                 sales, moves, policy)
 
     st.subheader("Model scorecard: comparison, top features and choice for each problem")
     st.dataframe(pd.DataFrame([
