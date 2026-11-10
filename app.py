@@ -128,7 +128,7 @@ st.sidebar.markdown(f"**{len(b):,} batches selected**")                    # fil
 st.sidebar.caption("The filters apply to the Batch quality, Equipment and Process control tabs.")
 
 tab = st.tabs(["Overview", "Sales", "Batch quality", "Equipment", "Process control", "Risk checker",
-               "Demand forecast", "Inventory", "Model summary"])
+               "Demand forecast", "Inventory", "Executive summary"])
 
 # ------------------------------------------------------------------ 1. overview
 with tab[0]:
@@ -380,9 +380,46 @@ with tab[7]:
     st.dataframe(p if show == "All" else p[p["status"] == show], width="stretch")  # item list
     st.download_button("Download list (CSV)", p.to_csv(index=False), "reorder_policy.csv")
 
-# ------------------------------------------------------------------ 9. model summary
+# ------------------------------------------------------------------ 9. executive summary
 with tab[8]:
-    st.subheader("Model comparison, top features and choice for each problem")
+    st.markdown('''<div style="background:#eef5fb;border-left:6px solid #1f4e79;padding:14px 18px;border-radius:10px;margin-bottom:14px">
+    <b>Bottom line.</b> Quality is high (96.9% of 60,000 batches pass) and failures are concentrated in assay and dissolution (47%).
+    Overdue (Critical) maintenance more than doubles the odds of failure, and ageing equipment explains most of the rise since 2019.
+    Pre-release data cannot predict individual failures well, so laboratory testing stays; the value lies in maintenance timing,
+    targeted checks, and buying stock to demand instead of far ahead of it.</div>''', unsafe_allow_html=True)  # headline message
+    crit = batches.loc[batches["maintenance_status"] == "Critical", "batch_failed"].mean()  # failure rate when Critical
+    cur = batches.loc[batches["maintenance_status"] == "Current", "batch_failed"].mean()   # failure rate when Current
+    c = st.columns(5)                                                       # headline cards
+    kpi(c[0], "🧪", "Batches passed", f"{1 - batches['batch_failed'].mean():.1%}", f"{len(batches):,} batches, {batches['batch_failed'].sum():,} failed", "blue",
+        bar=(1 - batches["batch_failed"].mean()) * 100)
+    kpi(c[1], "🔧", "Critical vs Current", f"{crit:.1%} vs {cur:.1%}", "failure rate · odds ratio 2.33", "red")
+    kpi(c[2], "📈", "Rise since 2019 explained", "60%", "2.78% → 3.73%, mainly equipment age", "orange", bar=60)
+    kpi(c[3], "🔮", "Forecast gain", "33.8%", "Holt-Winters vs last year's pattern", "green", bar=33.8)
+    kpi(c[4], "📦", "Overstocked items", f"{(policy['status'] == 'Overstock').sum():,}", f"of {len(policy):,} · {(policy['status'] == 'Reorder now').sum()} to reorder", "purple",
+        bar=(policy["status"] == "Overstock").mean() * 100)
+
+    st.subheader("1. What we asked and what the models found")
+    qa = pd.DataFrame([
+        ["Can we predict which batch will fail QC before release?", "Logistic regression vs random forest vs gradient boosting (time split)",
+         "Best test ROC-AUC 0.581; recall 0.82 needs 75% of batches flagged; precision 0.040 (target 0.19)", "Weakly — not good enough to replace lab testing"],
+        ["Does overdue maintenance raise failure risk?", "Adjusted logistic model (+ within-machine check)",
+         "Critical 6.9% vs Current 3.1%; odds ratio 2.33 (1.63–3.34), 2.35 within the same machine; Due Soon no effect", "Yes — Critical more than doubles the odds"],
+        ["Can maintenance status be predicted from the production record?", "Baseline vs logistic regression vs random forest",
+         "Random forest macro F1 0.501 (baseline 0.317); logistic finds 63% of Critical batches", "Moderately — useful as an early flag"],
+        ["Why did failures rise after 2019?", "Trend model with and without measured factors",
+         "Rate rose 2.78% → 3.73%; measured factors explain 60%; year effect falls to OR 1.002 (p = 0.72)", "Mostly explained — equipment over 10 years old went 35% → 77% of batches"],
+        ["Do process readings warn before a failure?", "Control limits, capability (Cpk), lead-time test",
+         "23.7% of failures vs 21.9% of passes had a prior warning (p = 0.074); no section reaches Cpk 1.33", "No useful early warning; assay capability is the gap"],
+        ["Which batches deserve extra checks?", "Composite risk score (0.6 quality, 0.2 equipment, 0.2 process)",
+         "High tier = 10% of batches, fails at 6.3% (lift 1.71), holds 17% of failures", "Use the High tier to target checks"],
+        ["How much will we sell next month and next week?", "Holt-Winters (monthly); Croston-SBA (weekly per product)",
+         "Monthly WAPE 5.5% (33.8% better than baseline); weekly WAPE 115% but 19.7% better, bias −5.9%", "Yes for planning totals; product-weeks stay noisy"],
+        ["Which items will run out, and is stock right-sized?", "Gradient boosting (stock-out); reorder-point rule",
+         "PR-AUC 0.278 (205× random), 80% of stock-outs caught; 1,033 of 1,200 items overstocked, 128 to reorder", "Stock-outs can be flagged; over-buying is the bigger problem"],
+    ], columns=["Question", "Model / method", "What we found", "Answer"])
+    st.dataframe(qa, hide_index=True, width="stretch")
+
+    st.subheader("Model scorecard: comparison, top features and choice for each problem")
     st.dataframe(pd.DataFrame([
         ["Batch failure", "Logistic, Random Forest, Gradient Boosting", "Logistic regression", "Test ROC-AUC 0.581", "Operator experience, equipment age, raw material"],
         ["Failure mode", "Majority guess, Random Forest", "None adopted (RF as a hint)", "Macro F1 0.141", "Pressure, production hours, humidity"],
@@ -396,13 +433,61 @@ with tab[8]:
         ["Product groups", "K-Means, k = 2 to 6", "K-Means, k = 2", "Silhouette 0.540", "Weekly units, variability, price"],
         ["Reorder policy", "Rule, not a model", "Reorder-point rule", "128 reorder / 1,033 overstock", "–"],
     ], columns=["Problem", "Models compared", "Chosen", "Score", "Top features"]), hide_index=True, width="stretch")
-    st.subheader("Recommendations")
+
+    st.subheader("2. The evidence in pictures")
+    c = st.columns(2)
+    gains = pd.DataFrame({"Problem": ["Monthly demand (Holt-Winters)", "Weekly demand (Croston-SBA)", "Maintenance status (RF, macro F1)",
+                                      "High risk tier (lift)", "Batch failure (ROC-AUC vs 0.5)"],
+                          "Gain over baseline (%)": [33.8, 19.7, 58.0, 71.0, 16.2]})       # chosen model vs its baseline
+    c[0].altair_chart(alt.Chart(gains).mark_bar(color=BLUE).encode(
+        y=alt.Y("Problem:N", sort="-x", title=None), x=alt.X("Gain over baseline (%):Q"),
+        tooltip=["Problem", "Gain over baseline (%)"]).properties(height=260, title="How much better than the simple baseline"), width="stretch")
+    c[0].caption("Stock-out model left out of the chart: 205× better than random would flatten the other bars.")
+    rates = batches.groupby("maintenance_status")["batch_failed"].mean().mul(100).reindex(["Current", "Due Soon", "Critical"]).reset_index(name="rate")
+    c[1].altair_chart(alt.Chart(rates).mark_bar().encode(
+        x=alt.X("maintenance_status:N", sort=None, title=None), y=alt.Y("rate:Q", title="Failure rate (%)"),
+        color=alt.Color("maintenance_status:N", scale=alt.Scale(domain=["Current", "Due Soon", "Critical"], range=[BLUE, ORANGE, RED]), legend=None),
+        tooltip=["maintenance_status", alt.Tooltip("rate:Q", format=".2f")]).properties(height=260, title="Failure rate by maintenance status"), width="stretch")
+    c = st.columns(2)
+    rise = pd.DataFrame({"part": ["2014–18 rate", "Explained by measured factors", "Unexplained"], "points": [2.78, 0.57, 0.38]})
+    rise["start"] = [0, 2.78, 3.35]
+    rise["end"] = rise["start"] + rise["points"]
+    c[0].altair_chart(alt.Chart(rise).mark_bar(size=46).encode(
+        x=alt.X("part:N", sort=None, title=None), y=alt.Y("start:Q", title="Failure rate (%)"), y2="end:Q",
+        color=alt.Color("part:N", scale=alt.Scale(domain=list(rise["part"]), range=[GREY, ORANGE, RED]), legend=None),
+        tooltip=["part", "points"]).properties(height=260, title="Rise to 3.73% in 2020–25: 60% explained"), width="stretch")
+    rules = pd.DataFrame({"Rule": ["Classifier alert", "Classifier alert", "High risk tier", "High risk tier"],
+                          "Measure": ["Batches flagged (%)", "Failures caught (%)"] * 2, "value": [75.5, 81.9, 10.0, 17.1]})
+    c[1].altair_chart(alt.Chart(rules).mark_bar().encode(
+        x=alt.X("Rule:N", title=None), y=alt.Y("value:Q", title="%"), xOffset="Measure:N",
+        color=alt.Color("Measure:N", scale=alt.Scale(range=[GREY, BLUE])), tooltip=["Rule", "Measure", "value"])
+        .properties(height=260, title="Back-test 2024–26: effort vs failures caught"), width="stretch")
+    st.altair_chart(alt.Chart(policy["status"].value_counts().reset_index(name="items")).mark_arc(innerRadius=70).encode(
+        theta="items:Q", color=alt.Color("status:N", scale=alt.Scale(domain=["Overstock", "Reorder now", "No recent demand", "OK"],
+                                                                     range=[ORANGE, RED, GREY, BLUE])),
+        tooltip=["status", "items"]).properties(height=260, title="Stock status of 1,200 branch-product items"), width="stretch")
+
+    st.subheader("3. How we handled what we found")
     st.dataframe(pd.DataFrame([
-        ["High", "QA / CAPA", "Corrective action on assay and dissolution failures", "47% of failures"],
-        ["High", "Engineering", "Service equipment before it becomes Critical", "Odds of failure 2.3× on overdue equipment"],
-        ["High", "Procurement", "Buy to the reorder-point policy; stop receipts for overstocked items", "Receipts about 2× sales"],
-        ["Medium", "Branch stores", "Weekly reorder list and stock-out watch-list", "Catches 80% of stock-outs"],
-        ["Medium", "Planning", "Holt-Winters for monthly volumes, Croston for weekly product demand", "34% / ~20% better than baseline"],
-        ["Medium", "Finance", "Review credit-account terms and collections", "All unpaid balances are on credit accounts"],
-        ["Low", "QA", "Use the risk tier only to target extra in-process checks", "Top 10% fail at 1.7× the average"],
-    ], columns=["Priority", "Owner", "Action", "Evidence"]), hide_index=True, width="stretch")
+        ["Only 3% of batches fail (imbalanced)", "Class weights in every model; PR-AUC and recall used to choose, not accuracy"],
+        ["Risk of the model 'seeing the future'", "Train 2007–21, tune 2022–23, test 2024–26 once; results measured at or after release (assay, yield) excluded"],
+        ["Classifier is weak", "Kept the simplest model (logistic); threshold set on validation for 80% recall; used only to rank batches, never to release them"],
+        ["Critical effect could be 'bad machines'", "Re-checked within the same machine (fixed effects): odds ratio 2.35 vs 2.33 — effect is real"],
+        ["Rise since 2019", "Decomposed the trend: measured factors added to the model; 60% explained, year effect no longer significant"],
+        ["Process drift as an early warning", "Control limits from passed batches up to 2021; lead-time test showed no useful signal, so not used for alerts"],
+        ["Intermittent weekly demand (48% zero weeks)", "Croston-SBA chosen; models with bias beyond ±10% rejected (linear regression −22%)"],
+        ["No opening stock in the data", "Stock rebuilt from zero; 6,045 cancelled-order movements removed; lead time assumed 14 days"],
+    ], columns=["Finding or risk", "How it was handled"]), hide_index=True, width="stretch")
+
+    st.subheader("4. Recommendations")
+    st.dataframe(pd.DataFrame([
+        ["High", "QA / CAPA", "Corrective action on assay and dissolution failures", "47% of failures", "Failure rate back below 3%"],
+        ["High", "Engineering", "Service equipment before it becomes Critical; plan replacement of machines over 10 years old", "Odds of failure 2.3× when Critical; age drives the rise", "No batch run on Critical equipment"],
+        ["High", "Procurement", "Buy to the reorder-point policy; stop receipts for overstocked items, especially Equipment", "1,033 items overstocked; Equipment receives 22× its sales", "Days of cover under 180"],
+        ["Medium", "Branch stores", "Weekly reorder list and stock-out watch-list", "Catches 80% of stock-outs", "Stock-out weeks down"],
+        ["Medium", "Planning", "Holt-Winters for monthly volumes, Croston-SBA for weekly product demand", "34% / 20% better than baseline", "Forecast error tracked monthly"],
+        ["Medium", "Finance", "Review credit-account terms and collections", f"KES {delivered['Balance_Due_KES'].sum() / 1e6:,.0f} m unpaid, all on credit accounts", "Unpaid share falling"],
+        ["Low", "QA", "Use the High risk tier only to target extra in-process checks", "Top 10% fail at 1.7× the average", "Failures found per check"],
+    ], columns=["Priority", "Owner", "Action", "Evidence", "Measure of success"]), hide_index=True, width="stretch")
+    st.caption("Limitations: no opening stock, expiry dates or supplier lead times; batches cannot be linked to sales; the maintenance-status model "
+               "uses a random split and may score slightly high; no savings are claimed until stock values are confirmed with stores.")
