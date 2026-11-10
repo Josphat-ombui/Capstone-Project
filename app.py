@@ -112,6 +112,234 @@ def rate_chart(df, col, title, sort="-y"):                                  # ba
     return (bars + avg).properties(title=title, height=280)                 # bars + plant average line
 
 
+# ------------------------------------------------------------------ commercial, finance and forecasting helpers
+@st.cache_data(show_spinner=False)
+def hw_forecast(y, h=12):                                                   # Holt-Winters: damped trend + monthly season
+    y = y.astype(float)                                                     # numbers as floats
+    try:
+        import warnings                                                     # hide fitting notes
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing        # the forecasting model
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            f = ExponentialSmoothing(y.to_numpy(), trend="add", damped_trend=True, seasonal="add",
+                                     seasonal_periods=12).fit().forecast(h)  # fit and forecast h months
+    except Exception:                                                       # statsmodels missing: last year x growth
+        growth = y.iloc[-12:].sum() / y.iloc[-24:-12].sum()
+        f = np.tile(y.iloc[-12:].to_numpy(), int(np.ceil(h / 12)))[:h] * growth
+    idx = pd.date_range(y.index[-1] + pd.offsets.MonthBegin(), periods=h, freq="MS")  # the next h months
+    return pd.Series(np.asarray(f), index=idx)
+
+
+def wape(actual, forecast):                                                 # weighted absolute percentage error
+    return float(np.abs(np.asarray(actual) - np.asarray(forecast)).sum() / np.abs(np.asarray(actual)).sum())
+
+
+def backtest(y):                                                            # hold out the last 12 months
+    hold = y.iloc[-12:]                                                     # months to predict
+    fc = pd.DataFrame({"Actual": hold.to_numpy(),
+                       "Seasonal naive": y.iloc[-24:-12].to_numpy(),        # same month last year
+                       "Moving average (12 m)": np.repeat(y.iloc[-24:-12].mean(), 12),  # average of the year before
+                       "Holt-Winters": hw_forecast(y.iloc[:-12], 12).to_numpy()}, index=hold.index)
+    acc = pd.DataFrame({"WAPE (%)": [wape(fc["Actual"], fc[m]) * 100 for m in fc.columns[1:]],
+                        "Bias (%)": [(fc[m].sum() / fc["Actual"].sum() - 1) * 100 for m in fc.columns[1:]]}, index=fc.columns[1:])
+    acc["Gain vs seasonal naive (%)"] = (1 - acc["WAPE (%)"] / acc.loc["Seasonal naive", "WAPE (%)"]) * 100
+    return fc, acc.round(1)
+
+
+@st.cache_data(show_spinner="Building the commercial tables...")
+def finance_tables(sales, moves):
+    s, m = sales.rename(columns=str.lower), moves.rename(columns=str.lower)  # one naming style
+    cancelled = s["order_status"].eq("Cancelled")                           # void orders
+    d = s[~cancelled].copy()                                                # delivered orders only
+    unit_cost = m[m["movement_type"].eq("Sale_Out")].drop_duplicates("reference_id").set_index("reference_id")["unit_cost_kes"]
+    d["cogs_kes"] = d["quantity"] * d["sale_id"].map(unit_cost)             # cost of goods sold per order
+    d["gross_profit_kes"] = d["net_amount_excl_vat_kes"] - d["cogs_kes"]    # revenue less cost
+    d["month"] = d["sale_date"].dt.to_period("M").dt.to_timestamp()        # month of sale
+    d["age_days"] = (s["sale_date"].max() - d["sale_date"]).dt.days         # invoice age at the data end date
+    stock = m.groupby(["branch_code", "product_id"])["quantity_change"].sum().clip(lower=0)  # units on hand (rebuilt from 0)
+    last_cost = m.groupby("product_id")["unit_cost_kes"].last()             # latest unit cost
+    stock_value = float((stock * stock.index.get_level_values("product_id").map(last_cost)).sum())  # stock at cost
+    return d, s[cancelled], stock_value
+
+
+def finance_page(sales, moves, pal, tn):                                    # the Commercial & finance view
+    c1, c2, c3, grey = pal                                                  # chart colours for this app
+    d, canc, stock_value = finance_tables(sales, moves)
+    rev, gp, cogs = d["net_amount_excl_vat_kes"].sum(), d["gross_profit_kes"].sum(), d["cogs_kes"].sum()
+    disc, gross = d["discount_amount_kes"].sum(), d["gross_amount_kes"].sum()
+    due, billed = d["balance_due_kes"].sum(), d["total_amount_kes"].sum()
+    cogs12 = d.loc[d["month"] > d["month"].max() - pd.DateOffset(months=12), "cogs_kes"].sum()  # last 12 months cost of sales
+    k = st.columns(4)
+    kpi(k[0], "💰", "Net revenue", f"KES {rev / 1e9:.2f} bn", f"{len(d):,} delivered orders, 2014–2025", tn[0])
+    kpi(k[1], "📈", "Gross profit", f"KES {gp / 1e9:.2f} bn", f"{gp / rev:.1%} gross margin", tn[1], bar=gp / rev * 100)
+    kpi(k[2], "🏷️", "Discounts given", f"KES {disc / 1e6:,.0f} m", f"{disc / gross:.1%} of gross sales", tn[2], bar=disc / gross * 100)
+    kpi(k[3], "🧾", "Receivables", f"KES {due / 1e6:,.0f} m", f"{1 - due / billed:.1%} of billed value collected", tn[3],
+        bar=(1 - due / billed) * 100)
+    k = st.columns(4)
+    kpi(k[0], "🏛️", "VAT billed", f"KES {d['vat_amount_kes'].sum() / 1e9:.2f} bn", "at 16% on net sales", tn[4])
+    kpi(k[1], "❌", "Cancelled orders", f"KES {canc['net_amount_excl_vat_kes'].sum() / 1e6:,.0f} m", f"{len(canc):,} orders not delivered", tn[2])
+    kpi(k[2], "📦", "Stock at cost", f"KES {stock_value / 1e9:.1f} bn", f"{stock_value / (cogs12 / 12):,.0f} months of cost of sales", tn[3])
+    kpi(k[3], "🛍️", "Average order", f"KES {rev / len(d):,.0f}", "net, excluding VAT", tn[5])
+
+    st.subheader("Revenue, gross profit and margin by year")
+    yr = d.groupby(d["sale_date"].dt.year.rename("year")).agg(revenue=("net_amount_excl_vat_kes", "sum"),
+                                                              gross_profit=("gross_profit_kes", "sum")).reset_index()
+    yr["margin_pct"] = yr["gross_profit"] / yr["revenue"] * 100
+    yl = yr.melt(["year", "margin_pct"], ["revenue", "gross_profit"], "measure", "kes")
+    yl["kes_m"] = yl["kes"] / 1e6
+    bars = alt.Chart(yl).mark_bar().encode(x=alt.X("year:O", title=None), xOffset="measure:N",
+                                           y=alt.Y("kes_m:Q", title="KES million"),
+                                           color=alt.Color("measure:N", scale=alt.Scale(range=[c2, c1]), title=None),
+                                           tooltip=["year", "measure", alt.Tooltip("kes_m:Q", format=",.0f")])
+    line = alt.Chart(yr).mark_line(color=c3, point=True).encode(x="year:O", y=alt.Y("margin_pct:Q", title="Gross margin (%)"),
+                                                                tooltip=["year", alt.Tooltip("margin_pct:Q", format=".1f")])
+    st.altair_chart(alt.layer(bars, line).resolve_scale(y="independent").properties(height=320), width="stretch")
+
+    c = st.columns(2)
+    cat = d.groupby("product_category").agg(revenue_kes_m=("net_amount_excl_vat_kes", lambda x: x.sum() / 1e6),
+                                            gross_profit_kes_m=("gross_profit_kes", lambda x: x.sum() / 1e6),
+                                            discount_kes_m=("discount_amount_kes", lambda x: x.sum() / 1e6),
+                                            orders=("sale_id", "size"))
+    cat["margin_pct"] = cat["gross_profit_kes_m"] / cat["revenue_kes_m"] * 100
+    cat = cat.sort_values("gross_profit_kes_m", ascending=False).round(1)
+    c[0].altair_chart(alt.Chart(cat.reset_index()).mark_bar().encode(
+        y=alt.Y("product_category:N", sort="-x", title=None), x=alt.X("gross_profit_kes_m:Q", title="Gross profit (KES m)"),
+        color=alt.Color("margin_pct:Q", scale=alt.Scale(scheme="greens"), title="Margin %"),
+        tooltip=list(cat.reset_index().columns)).properties(height=260, title="Gross profit by category (colour = margin)"), width="stretch")
+    c[0].dataframe(cat, width="stretch")
+    br = d.groupby("branch_code").agg(revenue_kes_m=("net_amount_excl_vat_kes", lambda x: x.sum() / 1e6),
+                                      gross_profit_kes_m=("gross_profit_kes", lambda x: x.sum() / 1e6),
+                                      orders=("sale_id", "size"), avg_order_kes=("net_amount_excl_vat_kes", "mean"),
+                                      unpaid_kes_m=("balance_due_kes", lambda x: x.sum() / 1e6))
+    br["margin_pct"] = br["gross_profit_kes_m"] / br["revenue_kes_m"] * 100
+    br["share_of_revenue_pct"] = br["revenue_kes_m"] / br["revenue_kes_m"].sum() * 100
+    c[1].altair_chart(alt.Chart(br.reset_index()).mark_arc(innerRadius=60).encode(
+        theta="revenue_kes_m:Q", color=alt.Color("branch_code:N", title="Branch"),
+        tooltip=["branch_code", alt.Tooltip("revenue_kes_m:Q", format=",.0f"), alt.Tooltip("margin_pct:Q", format=".1f")])
+        .properties(height=260, title="Revenue share by branch"), width="stretch")
+    c[1].dataframe(br.round(1), width="stretch")
+
+    st.subheader("Profitability")
+    last = d["month"] > d["month"].max() - pd.DateOffset(months=12)         # last 12 months of sales
+    rev12, gp12, cogs12b = (d.loc[last, c].sum() for c in ["net_amount_excl_vat_kes", "gross_profit_kes", "cogs_kes"])
+    k = st.columns(4)
+    kpi(k[0], "📊", "Gross profit margin", f"{gp / rev:.1%}", f"last 12 months {gp12 / rev12:.1%}", tn[1], bar=gp / rev * 100)
+    kpi(k[1], "➕", "Markup on cost", f"{gp / cogs:.1%}", "gross profit ÷ cost of goods sold", tn[4])
+    kpi(k[2], "🧮", "Gross profit per order", f"KES {gp / len(d):,.0f}", f"on an average order of KES {rev / len(d):,.0f}", tn[5])
+    kpi(k[3], "💸", "Discount share of profit", f"{disc / gp:.1%}", "discounts given ÷ gross profit", tn[2], bar=disc / gp * 100)
+    mm = d.groupby("month").agg(revenue=("net_amount_excl_vat_kes", "sum"), gp=("gross_profit_kes", "sum"))
+    mm["Monthly margin (%)"] = mm["gp"] / mm["revenue"] * 100               # gross margin each month
+    mm["12-month rolling margin (%)"] = mm["gp"].rolling(12).sum() / mm["revenue"].rolling(12).sum() * 100
+    st.markdown("**Gross profit margin over time**")
+    st.line_chart(mm[["Monthly margin (%)", "12-month rolling margin (%)"]], color=[grey, c1])
+    c = st.columns(2)
+    dl = d.groupby("discount_pct").agg(orders=("sale_id", "size"), revenue_kes_m=("net_amount_excl_vat_kes", lambda x: x.sum() / 1e6),
+                                       gross_profit_kes_m=("gross_profit_kes", lambda x: x.sum() / 1e6))
+    dl["margin_pct"] = dl["gross_profit_kes_m"] / dl["revenue_kes_m"] * 100
+    c[0].altair_chart(alt.Chart(dl.reset_index()).mark_bar(color=c3).encode(
+        x=alt.X("discount_pct:O", title="Discount (%)"), y=alt.Y("margin_pct:Q", title="Gross margin (%)"),
+        tooltip=["discount_pct", "orders", alt.Tooltip("revenue_kes_m:Q", format=",.0f"), alt.Tooltip("margin_pct:Q", format=".1f")])
+        .properties(height=260, title="Margin falls as the discount rises"), width="stretch")
+    c[0].dataframe(dl.round(1), width="stretch")
+    rep = d.groupby("sales_rep_id").agg(orders=("sale_id", "size"), revenue_kes_m=("net_amount_excl_vat_kes", lambda x: x.sum() / 1e6),
+                                        gross_profit_kes_m=("gross_profit_kes", lambda x: x.sum() / 1e6),
+                                        discount_pct=("discount_pct", "mean"), unpaid_kes_m=("balance_due_kes", lambda x: x.sum() / 1e6))
+    rep["margin_pct"] = rep["gross_profit_kes_m"] / rep["revenue_kes_m"] * 100
+    c[1].altair_chart(alt.Chart(rep.reset_index()).mark_bar().encode(
+        y=alt.Y("sales_rep_id:N", sort="-x", title=None), x=alt.X("gross_profit_kes_m:Q", title="Gross profit (KES m)"),
+        color=alt.Color("margin_pct:Q", scale=alt.Scale(scheme="greens"), title="Margin %"),
+        tooltip=["sales_rep_id", "orders", alt.Tooltip("gross_profit_kes_m:Q", format=",.1f"), alt.Tooltip("margin_pct:Q", format=".1f")])
+        .properties(height=260, title="Gross profit by sales rep"), width="stretch")
+    c[1].dataframe(rep.sort_values("gross_profit_kes_m", ascending=False).round(1), width="stretch")
+    prod = d.groupby(["product_id", "product_category"]).agg(revenue_kes_m=("net_amount_excl_vat_kes", lambda x: x.sum() / 1e6),
+                                                             gross_profit_kes_m=("gross_profit_kes", lambda x: x.sum() / 1e6),
+                                                             units=("quantity", "sum")).reset_index()
+    prod["margin_pct"] = prod["gross_profit_kes_m"] / prod["revenue_kes_m"] * 100
+    c = st.columns(2)
+    c[0].markdown("**Top 10 products by gross profit**")
+    c[0].dataframe(prod.nlargest(10, "gross_profit_kes_m").round(2), hide_index=True, width="stretch")
+    c[1].markdown("**Lowest-margin 10 products**")
+    c[1].dataframe(prod.nsmallest(10, "margin_pct").round(2), hide_index=True, width="stretch")
+
+    st.subheader("Working capital and customers")
+    billed12 = d.loc[last, "total_amount_kes"].sum()                         # value invoiced in the last 12 months
+    dso, turns = due / billed12 * 365, cogs12b / stock_value                # days sales outstanding, stock turns a year
+    top10 = d.groupby("customer_id")["net_amount_excl_vat_kes"].sum().nlargest(10).sum() / rev  # customer concentration
+    k = st.columns(4)
+    kpi(k[0], "⏳", "Days sales outstanding", f"{dso:,.0f} days", "unpaid ÷ last 12 months billed × 365", tn[3])
+    kpi(k[1], "🔄", "Inventory turnover", f"{turns:.2f}× a year", f"about {365 / turns:,.0f} days of stock on hand", tn[2])
+    kpi(k[2], "💹", "GMROI", f"{gp12 / stock_value:.3f}", "gross profit per KES 1 of stock at cost", tn[5])
+    kpi(k[3], "👥", "Top 10 customers", f"{top10:.1%}", f"of revenue · {d['customer_id'].nunique():,} customers", tn[4], bar=top10 * 100)
+    st.caption("Stock is rebuilt from zero (no opening stock in the data) and is mostly Equipment, so turnover is very low and GMROI tiny: "
+               "the clearest sign that purchasing runs far ahead of sales. Net profit cannot be calculated because the data has no operating costs.")
+
+    st.subheader("Receivables (unpaid balances)")
+    ag = d[d["balance_due_kes"] > 0].copy()                                 # invoices with money owed
+    ag["age"] = pd.cut(ag["age_days"], [-1, 30, 90, 180, 365, 100000], labels=["0–30 days", "31–90", "91–180", "181–365", "over 1 year"])
+    aging = ag.groupby("age", observed=False)["balance_due_kes"].sum().div(1e6).reset_index(name="kes_m")
+    c = st.columns(2)
+    c[0].altair_chart(alt.Chart(aging).mark_bar(color=c3).encode(
+        x=alt.X("age:N", sort=None, title="Invoice age at the data end date"), y=alt.Y("kes_m:Q", title="Unpaid (KES m)"),
+        tooltip=["age", alt.Tooltip("kes_m:Q", format=",.1f")]).properties(height=260, title="Unpaid balance by invoice age"), width="stretch")
+    pm = d.groupby("payment_method").agg(billed_kes_m=("total_amount_kes", lambda x: x.sum() / 1e6),
+                                         unpaid_kes_m=("balance_due_kes", lambda x: x.sum() / 1e6))
+    pm["unpaid_pct"] = pm["unpaid_kes_m"] / pm["billed_kes_m"] * 100
+    c[1].markdown("**Billed and unpaid by payment method**")
+    c[1].dataframe(pm.round(1), width="stretch")
+    c[1].markdown("**Top 10 customers by unpaid balance**")
+    c[1].dataframe(d.groupby("customer_id").agg(unpaid_kes_m=("balance_due_kes", lambda x: x.sum() / 1e6), orders=("sale_id", "size"))
+                   .sort_values("unpaid_kes_m", ascending=False).head(10).round(2), width="stretch")
+
+    st.subheader("Revenue forecast (next 12 months)")
+    choice = st.selectbox("Revenue series", ["Total"] + sorted(d["product_category"].unique()), key="fin_series")
+    dd = d if choice == "Total" else d[d["product_category"] == choice]     # chosen category
+    y = dd.groupby("month")["net_amount_excl_vat_kes"].sum().asfreq("MS", fill_value=0) / 1e6  # monthly revenue, KES m
+    fc, acc = backtest(y)                                                   # accuracy on the last 12 months
+    future = hw_forecast(y, 12)                                             # next 12 months
+    m12 = dd.loc[dd["month"] > dd["month"].max() - pd.DateOffset(months=12)]
+    margin12 = m12["gross_profit_kes"].sum() / m12["net_amount_excl_vat_kes"].sum()  # trailing 12-month margin
+    k = st.columns(4)
+    growth = future.sum() / y.iloc[-12:].sum() - 1
+    kpi(k[0], "🔮", "Forecast revenue", f"KES {future.sum():,.0f} m", "next 12 months", tn[0])
+    kpi(k[1], "📈" if growth >= 0 else "📉", "Change vs last 12 months", f"{growth:+.1%}", f"last 12 months KES {y.iloc[-12:].sum():,.0f} m",
+        tn[1] if growth >= 0 else tn[2])
+    kpi(k[2], "💵", "Projected gross profit", f"KES {future.sum() * margin12:,.0f} m", f"at the last 12 months' margin ({margin12:.1%})", tn[4])
+    kpi(k[3], "🎯", "Forecast error", f"{acc.loc['Holt-Winters', 'WAPE (%)']:.1f}%",
+        f"WAPE on last 12 months vs {acc.loc['Seasonal naive', 'WAPE (%)']:.1f}% seasonal naive", tn[5])
+    st.line_chart(pd.DataFrame({"Actual (KES m)": y, "Forecast (KES m)": future}), color=[c1, c3])
+    c = st.columns(2)
+    c[0].markdown("**Back-test on the last 12 months (KES m)**")
+    c[0].line_chart(fc)
+    c[1].markdown("**Accuracy of each method**")
+    c[1].dataframe(acc, width="stretch")
+    out = pd.DataFrame({"forecast_revenue_kes_m": future.round(1), "projected_gross_profit_kes_m": (future * margin12).round(1)})
+    c[1].markdown("**Monthly forecast**")
+    c[1].dataframe(out, width="stretch")
+    st.download_button("Download revenue forecast (CSV)", out.to_csv(), "revenue_forecast.csv", key="fin_dl")
+    st.caption("Gross profit uses the unit cost recorded on each sale's stock movement. Receivables age is measured at the last sale date "
+               "in the data. Forecasts use Holt-Winters (damped trend, monthly seasonality).")
+
+
+def finance_headline(sales, moves):                                         # three numbers for the executive summary
+    d, canc, stock_value = finance_tables(sales, moves)
+    rev, gp = d["net_amount_excl_vat_kes"].sum(), d["gross_profit_kes"].sum()
+    y = d.groupby("month")["net_amount_excl_vat_kes"].sum().asfreq("MS", fill_value=0) / 1e6
+    return dict(revenue=rev, margin=gp / rev, unpaid=d["balance_due_kes"].sum(), stock_value=stock_value,
+                forecast=hw_forecast(y, 12).sum(), last12=y.iloc[-12:].sum(), cancelled=canc["net_amount_excl_vat_kes"].sum())
+
+
+def exec_commercial(sales, moves, tn):                                      # commercial picture for the executive summary
+    h = finance_headline(sales, moves)
+    st.subheader("Commercial picture")
+    k = st.columns(4)
+    kpi(k[0], "💰", "Revenue & margin", f"KES {h['revenue'] / 1e9:.1f} bn", f"{h['margin']:.1%} gross margin, 2014–2025", tn[0], bar=h["margin"] * 100)
+    kpi(k[1], "🔮", "Next 12 months", f"KES {h['forecast'] / 1e3:.2f} bn", f"{h['forecast'] / h['last12'] - 1:+.1%} vs last 12 months", tn[1])
+    kpi(k[2], "🧾", "Receivables", f"KES {h['unpaid'] / 1e6:,.0f} m", "unpaid, all on credit accounts", tn[3])
+    kpi(k[3], "📦", "Stock at cost", f"KES {h['stock_value'] / 1e9:.1f} bn", "cash tied up in inventory", tn[2])
+    st.caption(f"Cancelled orders took KES {h['cancelled'] / 1e6:,.0f} m of revenue off the books. Freeing over-bought stock and collecting "
+               "credit-account balances are the two biggest cash levers; see the Commercial & finance view for detail.")
+
+
 batches, sales, moves = load_data()                                         # load once
 delivered = sales[sales["is_cancelled"] == 0]                               # delivered orders
 policy = reorder_policy(moves)                                              # reorder status per item
@@ -128,7 +356,7 @@ st.sidebar.markdown(f"**{len(b):,} batches selected**")                    # fil
 st.sidebar.caption("The filters apply to the Batch quality, Equipment and Process control tabs.")
 
 tab = st.tabs(["Overview", "Sales", "Batch quality", "Equipment", "Process control", "Risk checker",
-               "Demand forecast", "Inventory", "Executive summary"])
+               "Demand forecast", "Inventory", "Commercial & finance", "Executive summary"])
 
 # ------------------------------------------------------------------ 1. overview
 with tab[0]:
@@ -380,8 +608,12 @@ with tab[7]:
     st.dataframe(p if show == "All" else p[p["status"] == show], width="stretch")  # item list
     st.download_button("Download list (CSV)", p.to_csv(index=False), "reorder_policy.csv")
 
-# ------------------------------------------------------------------ 9. executive summary
+# ------------------------------------------------------------------ 9. commercial and finance
 with tab[8]:
+    finance_page(sales, moves, (BLUE, "#52be80", ORANGE, GREY), ["green", "teal", "red", "purple", "blue", "orange"])
+
+# ------------------------------------------------------------------ 10. executive summary
+with tab[9]:
     st.markdown('''<div style="background:#eef5fb;border-left:6px solid #1f4e79;padding:14px 18px;border-radius:10px;margin-bottom:14px">
     <b>Bottom line.</b> Quality is high (96.9% of 60,000 batches pass) and failures are concentrated in assay and dissolution (47%).
     Overdue (Critical) maintenance more than doubles the odds of failure, and ageing equipment explains most of the rise since 2019.
@@ -398,6 +630,7 @@ with tab[8]:
     kpi(c[4], "📦", "Overstocked items", f"{(policy['status'] == 'Overstock').sum():,}", f"of {len(policy):,} · {(policy['status'] == 'Reorder now').sum()} to reorder", "purple",
         bar=(policy["status"] == "Overstock").mean() * 100)
 
+    exec_commercial(sales, moves, ["green", "teal", "orange", "purple"])   # revenue, forecast, receivables, stock value
     st.subheader("1. What we asked and what the models found")
     qa = pd.DataFrame([
         ["Can we predict which batch will fail QC before release?", "Logistic regression vs random forest vs gradient boosting (time split)",
