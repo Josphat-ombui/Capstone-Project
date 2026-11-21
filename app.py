@@ -21,7 +21,7 @@ from src.reliability import add_bands, equipment_table, fit_maintenance_model, o
 
 warnings.filterwarnings("ignore", category=UserWarning)                     # e.g. statsmodels convergence notes
 warnings.filterwarnings("ignore", module="statsmodels")                     # Holt-Winters fitting messages
-st.set_page_config(page_title="Pharma Operations Intelligence", layout="wide")  # page settings
+st.set_page_config(page_title="Batch Quality and Machine Reliability Platform", layout="wide")  # page settings
 alt.data_transformers.disable_max_rows()                                    # allow charts with many points
 BLUE, ORANGE, RED, GREY = "#1f4e79", "#f28e2b", "#c0392b", "#7f7f7f"        # chart colours
 TONES = {"blue": ("#1f4e79", "#2e86c1"), "green": ("#1e8449", "#52be80"), "orange": ("#d35400", "#f5b041"),  # card gradients
@@ -703,7 +703,7 @@ delivered = sales[sales["is_cancelled"] == 0]                               # de
 policy = reorder_policy(moves)                                              # reorder status per item
 
 # ------------------------------------------------------------------ header and sidebar
-st.markdown('''<div class="banner"><h1>Pharmaceutical Operations Intelligence System</h1>
+st.markdown('''<div class="banner"><h1>Batch Quality and Machine Reliability Platform</h1>
 <p>Batch quality · equipment maintenance · process control · sales · demand · inventory — LAL data, 2007–2026</p></div>''',
             unsafe_allow_html=True)                                         # page banner
 yr = st.sidebar.slider("Production years", 2007, 2026, (2007, 2026))       # year filter for quality tabs
@@ -974,6 +974,29 @@ with T["What-if predictor"]:
 
 # ------------------------------------------------------------------ 10. executive summary
 with T["Executive summary"]:
+    st.subheader("Final results: test period 2024–26, models trained on earlier years only")  # headline results from the final report
+    goals = [("Classifier recall", "81.9%", "at least 80%", True), ("Classifier precision", "4.0%", "at least 19%", False),
+             ("Classifier ROC-AUC", "0.581", "at least 0.80", False), ("Critical maintenance effect", "2.33×", "effect with interval (1.63–3.34)", True),
+             ("Forecast gain vs seasonal", "23.0%", "at least 15%", True)]          # the five targets set in the proposal
+    c = st.columns(5)                                                       # one card per target
+    for col, (name, res, goal, met) in zip(c, goals):
+        kpi(col, "", name, res, f"{'Met' if met else 'Missed'} · goal {goal}", "green" if met else "red")
+    st.caption(f"{sum(g[3] for g in goals)} of 5 targets met. Both misses are in the batch classifier: at a 3.1% failure rate the batch files "
+               "do not hold enough detail for high precision, so the alert list orders QA review and never decides release.")
+    c = st.columns(2)                                                       # agreed actions and decisions
+    c[0].markdown("**Recommendations**")
+    c[0].dataframe(pd.DataFrame([[1, "Use the alert list to order QA review, highest-risk batches first"],
+                                 [2, "Treat Critical maintenance as a pre-release check"],
+                                 [3, "Track variance readings more closely than averages"],
+                                 [4, "Pilot the 5% discount cap in one branch before any rollout"],
+                                 [5, "Reconcile the credit balance field with the finance ledger before collections"]],
+                                columns=["#", "Action"]), hide_index=True, width="stretch")
+    c[1].markdown("**Decisions needed from management**")
+    c[1].dataframe(pd.DataFrame([["Risk-score weights", "Sign off quality 0.6 · equipment 0.2 · process 0.2"],
+                                 ["Assumptions", "Confirm assay spec 95–105%, reorder lead times and the discount cap"],
+                                 ["Missing data", "Provide repair and downtime records, raw-material and dissolution-time records"]],
+                                columns=["Decision", "What is needed"]), hide_index=True, width="stretch")
+    st.divider()
     crit = batches.loc[batches["maintenance_status"] == "Critical", "batch_failed"].mean()  # failure rate when Critical
     cur = batches.loc[batches["maintenance_status"] == "Current", "batch_failed"].mean()   # failure rate when Current
     c = st.columns(5)                                                       # headline cards
@@ -981,7 +1004,7 @@ with T["Executive summary"]:
         bar=(1 - batches["batch_failed"].mean()) * 100)
     kpi(c[1], "", "Critical vs Current", f"{crit:.1%} vs {cur:.1%}", "failure rate · odds ratio 2.33", "red")
     kpi(c[2], "", "Rise since 2019 explained", "60%", "2.78% → 3.73%", "orange", bar=60)
-    kpi(c[3], "", "Forecast gain", "33.8%", "Holt-Winters vs baseline", "green", bar=33.8)
+    kpi(c[3], "", "Forecast gain", "37.5%", "Holt-Winters vs baseline", "green", bar=37.5)
     kpi(c[4], "", "Overstocked items", f"{(policy['status'] == 'Overstock').sum():,}", f"of {len(policy):,} · {(policy['status'] == 'Reorder now').sum()} to reorder", "purple",
         bar=(policy["status"] == "Overstock").mean() * 100)
     exec_commercial(sales, moves, ["green", "teal", "orange", "purple"])   # revenue, forecast, receivables, stock value
